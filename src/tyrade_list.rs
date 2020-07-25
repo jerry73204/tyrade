@@ -1,5 +1,5 @@
-use tyrade_macro::tyrade;
 use crate::tyrade_types::*;
+use tyrade_macro::tyrade;
 
 tyrade! {
 
@@ -33,7 +33,7 @@ tyrade! {
 
 #[test]
 fn list_test() {
-  use crate::test_utils::assert_type_eq;
-  assert_type_eq::<S<S<Z>>, TListLen<Cons<(), Cons<(), Nil>>>>();
-  assert_type_eq::<u64, TListNth<Cons<i32, Cons<u64, Nil>>, S<Z>>>();
+    use crate::test_utils::assert_type_eq;
+    assert_type_eq::<S<S<Z>>, TListLen<Cons<(), Cons<(), Nil>>>>();
+    assert_type_eq::<u64, TListNth<Cons<i32, Cons<u64, Nil>>, S<Z>>>();
 }

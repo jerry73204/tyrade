@@ -19,8 +19,8 @@ tyrade! {
 
 #[test]
 fn sec_test() {
-  assert_type_eq::<Low, MaxSec<Low, Low>>();
-  assert_type_eq::<High, MaxSec<Low, High>>();
-  assert_type_eq::<High, MaxSec<High, Low>>();
-  assert_type_eq::<High, MaxSec<High, High>>();
+    assert_type_eq::<Low, MaxSec<Low, Low>>();
+    assert_type_eq::<High, MaxSec<Low, High>>();
+    assert_type_eq::<High, MaxSec<High, Low>>();
+    assert_type_eq::<High, MaxSec<High, High>>();
 }

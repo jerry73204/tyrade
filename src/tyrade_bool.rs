@@ -1,5 +1,5 @@
-use tyrade_macro::tyrade;
 use crate::tyrade_types::*;
+use tyrade_macro::tyrade;
 
 tyrade! {
   fn TIf<K>(Cond: TBool, Then: K, Else: K) -> K {
@@ -22,9 +22,9 @@ tyrade! {
 
 #[test]
 fn bool_tests() {
-  use crate::test_utils::assert_type_eq;
-  assert_type_eq::<TTrue, TAnd<TTrue, TTrue>>();
-  assert_type_eq::<TFalse, TAnd<TTrue, TFalse>>();
-  assert_type_eq::<TFalse, TAnd<TFalse, TTrue>>();
-  assert_type_eq::<TFalse, TAnd<TFalse, TFalse>>();
+    use crate::test_utils::assert_type_eq;
+    assert_type_eq::<TTrue, TAnd<TTrue, TTrue>>();
+    assert_type_eq::<TFalse, TAnd<TTrue, TFalse>>();
+    assert_type_eq::<TFalse, TAnd<TFalse, TTrue>>();
+    assert_type_eq::<TFalse, TAnd<TFalse, TFalse>>();
 }

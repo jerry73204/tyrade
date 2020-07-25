@@ -1,6 +1,6 @@
-use tyrade_macro::tyrade;
-use crate::tyrade_types::*;
 use crate::tyrade_bool::*;
+use crate::tyrade_types::*;
+use tyrade_macro::tyrade;
 
 tyrade! {
   fn TAdd(N1: TNum, N2: TNum) -> TNum {
@@ -48,15 +48,15 @@ tyrade! {
 
 #[test]
 fn num_tests() {
-  use crate::test_utils::assert_type_eq;
-  assert_type_eq::<S<Z>, TAdd<Z, S<Z>>>();
-  assert_type_eq::<S<S<Z>>, TAdd<S<Z>, S<Z>>>();
+    use crate::test_utils::assert_type_eq;
+    assert_type_eq::<S<Z>, TAdd<Z, S<Z>>>();
+    assert_type_eq::<S<S<Z>>, TAdd<S<Z>, S<Z>>>();
 
-  assert_type_eq::<TTrue, TLessThanEqual<S<Z>, S<S<Z>>>>();
-  assert_type_eq::<TFalse, TLessThanEqual<S<S<Z>>, Z>>();
+    assert_type_eq::<TTrue, TLessThanEqual<S<Z>, S<S<Z>>>>();
+    assert_type_eq::<TFalse, TLessThanEqual<S<S<Z>>, Z>>();
 
-  assert_type_eq::<S<Z>, TSub<S<S<Z>>, S<Z>>>();
+    assert_type_eq::<S<Z>, TSub<S<S<Z>>, S<Z>>>();
 
-  // TODO: this causes overflow?
-  // assert_type_eq::<S<S<Z>>, TDivide<S<S<S<S<Z>>>>, S<S<Z>>>>();
+    // TODO: this causes overflow?
+    // assert_type_eq::<S<S<Z>>, TDivide<S<S<S<S<Z>>>>, S<S<Z>>>>();
 }

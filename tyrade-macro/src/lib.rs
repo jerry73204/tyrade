@@ -1,9 +1,9 @@
 use proc_macro::TokenStream;
 
-mod trans;
 mod macro_utils;
+mod trans;
 
 #[proc_macro]
 pub fn tyrade(tokens: TokenStream) -> TokenStream {
-  macro_utils::tyrade(tokens)
+    macro_utils::tyrade(tokens)
 }
