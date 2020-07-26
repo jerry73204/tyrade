@@ -1,13 +1,19 @@
 use itertools::Itertools;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
-use syn::visit_mut::VisitMut;
-use syn::{
-    parse2, BinOp, Block, Expr, ExprBlock, Fields, FnArg, GenericParam, Ident, Item, ItemEnum,
-    ItemFn, Pat, PatIdent, Path, PathSegment, ReturnType, Stmt, Type, TypeParam, TypePath,
+use std::{
+    collections::{HashMap, HashSet},
+    iter::Sum,
+    ops::Add,
 };
+use syn::{
+    parse2, visit_mut::VisitMut, BinOp, Block, Expr, ExprBinary, ExprBlock, ExprCall, ExprIf,
+    ExprMatch, ExprPath, ExprTuple, Fields, FnArg, GenericParam, Ident, Item, ItemEnum, ItemFn,
+    Pat, PatIdent, Path, PathSegment, ReturnType, Stmt, Type, TypeParam, TypePath,
+};
+
+// HACK: have to do this without HKT :(
+const BASE_KINDS: &[&str] = &["TNum", "TBool", "TList"];
 
 fn type_to_ident(ty: &Type) -> Option<Ident> {
     if let Type::Path(TypePath { path, .. }) = ty {
@@ -108,14 +114,10 @@ struct FnTransEnv {
     substitutions: HashMap<Ident, Type>,
 }
 
-fn merge_vecs<T: Clone + Eq + Hash>(v1: &Vec<T>, v2: &Vec<T>) -> Vec<T> {
-    let h1 = v1.iter().collect::<HashSet<_>>();
-    let h2 = v2.iter().collect::<HashSet<_>>();
-    (&h1 | &h2).iter().cloned().cloned().collect::<Vec<_>>()
-}
+impl Add<Self> for FnTransEnv {
+    type Output = Self;
 
-impl FnTransEnv {
-    fn merge(self, other: FnTransEnv) -> FnTransEnv {
+    fn add(self, other: Self) -> Self {
         let args = self
             .args
             .iter()
@@ -132,17 +134,28 @@ impl FnTransEnv {
             .cloned()
             .collect::<Vec<_>>();
 
-        let quantifiers = merge_vecs(&self.quantifiers, &other.quantifiers);
-
-        let mut bounds = self.bounds.clone();
-        for (k, v) in other.bounds.clone().into_iter() {
-            let v2 = bounds.entry(k).or_insert(vec![]);
-            *v2 = merge_vecs(&v, v2);
-        }
+        let quantifiers: Vec<_> = itertools::merge(self.quantifiers, other.quantifiers)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let bounds: HashMap<_, Vec<_>> = self
+            .bounds
+            .into_iter()
+            .chain(other.bounds)
+            .into_group_map()
+            .into_iter()
+            .map(|(k, vecs)| {
+                let v: Vec<_> = vecs.into_iter().flatten().collect();
+                (k, v)
+            })
+            .collect();
 
         // TODO: is this correct?
-        let mut substitutions = self.substitutions.clone();
-        substitutions.extend(other.substitutions.clone().into_iter());
+        let substitutions: HashMap<_, _> = self
+            .substitutions
+            .into_iter()
+            .chain(other.substitutions)
+            .collect();
 
         FnTransEnv {
             args,
@@ -150,6 +163,15 @@ impl FnTransEnv {
             bounds,
             substitutions,
         }
+    }
+}
+
+impl Sum<Self> for FnTransEnv {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Self>,
+    {
+        iter.fold1(|lhs, rhs| lhs + rhs).unwrap()
     }
 }
 
@@ -169,17 +191,8 @@ impl FnTransOutput {
             .map(|v| v.into_iter())
             .multi_cartesian_product()
             .map(|outp| {
-                let args = outp
-                    .clone()
-                    .into_iter()
-                    .map(|o| o.output_ty)
-                    .collect::<Vec<_>>();
-                let first_env = outp[0].env.clone();
-                let merged_env = outp
-                    .into_iter()
-                    .skip(1)
-                    .map(|o| o.env)
-                    .fold(first_env, |env1, env2| env1.merge(env2));
+                let args: Vec<_> = outp.clone().into_iter().map(|o| o.output_ty).collect();
+                let merged_env: FnTransEnv = outp.into_iter().map(|out| out.env).sum();
                 f(merged_env, args)
             })
             .collect::<Vec<_>>()
@@ -188,192 +201,223 @@ impl FnTransOutput {
 
 fn translate_expr(env: &FnTransEnv, cur_kind: &Ident, expr: &Expr) -> Vec<FnTransOutput> {
     match expr {
-        Expr::Match(match_) => {
-            let matched_ident = if let Expr::Path(path) = &*match_.expr {
-                path.path.get_ident().unwrap()
-            } else {
-                unimplemented!("match expr")
-            };
-
-            let match_ty = ident_to_type(matched_ident);
-            let arg_idx = env
-                .args
-                .iter()
-                .position(|arg| arg == &match_ty)
-                .expect(&format!("Invalid match on {}", matched_ident));
-
-            match_
-                .arms
-                .iter()
-                .map(|arm| {
-                    let (variant, fields) =
-                        match &arm.pat {
-                            Pat::Ident(PatIdent { ident, .. }) => (ident.clone(), vec![]),
-                            Pat::TupleStruct(tuple_struct) => {
-                                let variant = tuple_struct.path.get_ident().unwrap().clone();
-                                let fields = tuple_struct.pat.elems.iter().map(|p| {
-              if let Pat::Ident(PatIdent { ident, subpat, .. }) = &p  {
-                let kind = if let Some((_, p2)) = subpat {
-                  if let Pat::Ident(PatIdent { ident, .. }) = &**p2 {
-                    ident.clone()
-                  } else {
-                    panic!("RHS of @ must be an ident")
-                  }
-                } else {
-                  panic!("Match tuple struct must have @ trait annotation")
-                };
-
-                (ident.clone(), kind)
-              } else {
-                unimplemented!("match pat ident")
-              }
-            }).collect::<Vec<_>>();
-                                (variant, fields)
-                            }
-                            _ => unimplemented!("match pat"),
-                        };
-
-                    let mut env = env.clone();
-                    let field_names = fields
-                        .iter()
-                        .map(|(ident, _)| ident)
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    // if args = [X, Y] and expr is match Y { Q(Z) => ... }
-                    // then update args to be [X, Q<Z>]
-                    let new_type: Type = parse2(quote! {
-                      #variant<#(#field_names),*>
-                    })
-                    .unwrap();
-                    env.args[arg_idx] = new_type.clone();
-
-                    // if quantifiers = [X, Y] then replace [Y] with [Z]
-                    env.quantifiers = env
-                        .quantifiers
-                        .into_iter()
-                        .filter(|ident| ident != matched_ident)
-                        .collect::<Vec<_>>();
-                    env.quantifiers.extend(field_names);
-
-                    // if bounds = {Y: Foo<X>} then rename to {Q<Z>: Foo<X>}
-                    let bounds = env.bounds.remove(&ident_to_type(&matched_ident)).unwrap();
-                    env.bounds.insert(new_type.clone(), bounds);
-
-                    // add field bounds
-                    for (ident, kind) in fields.iter() {
-                        if let Some(kind) = kind_to_type(kind) {
-                            env.bounds.insert(ident_to_type(ident), vec![kind]);
-                        }
-                    }
-
-                    // add substitution for Y -> Q<Z>
-                    env.substitutions.insert(matched_ident.clone(), new_type);
-
-                    translate_expr(&env, cur_kind, &arm.body)
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        }
-
-        Expr::Path(path) => {
-            let ident = path.path.get_ident().unwrap();
-            let ty = env
-                .substitutions
-                .get(&ident)
-                .cloned()
-                .unwrap_or_else(|| ident_to_type(ident));
-            vec![FnTransOutput {
-                env: env.clone(),
-                output_ty: quote! { #ty },
-            }]
-        }
-
-        Expr::Tuple(tuple) => {
-            if tuple.elems.len() == 0 {
-                vec![FnTransOutput {
-                    env: env.clone(),
-                    output_ty: quote! { () },
-                }]
-            } else {
-                unimplemented!("tuple")
-            }
-        }
-
-        Expr::Binary(binop) => {
-            let left = &binop.left;
-            let right = &binop.right;
-            let op = match &binop.op {
-                BinOp::Eq(_) => quote! { TypeEquals },
-                BinOp::And(_) => quote! { TAnd },
-                BinOp::Le(_) => quote! { TLessThanEqual },
-                BinOp::Add(_) => quote! { TAdd },
-                BinOp::Div(_) => quote! { TDivide },
-                BinOp::Sub(_) => quote! { TSub },
-                _ => unimplemented!("binop {:?}", binop.op),
-            };
-            let trans_expr: Expr = parse2(quote! { #op(#left, #right) }).unwrap();
-            translate_expr(env, cur_kind, &trans_expr)
-        }
-
-        Expr::If(if_) => {
-            let cond = &if_.cond;
-            let then = &if_.then_branch;
-            let else_ = &if_
-                .else_branch
-                .as_ref()
-                .expect("If expression must have an 'else'")
-                .1;
-            let if_name = Ident::new(&format!("TIf{}", cur_kind), Span::call_site());
-            let trans_expr: Expr = parse2(quote! { #if_name(#cond, #then, #else_) }).unwrap();
-            translate_expr(env, cur_kind, &trans_expr)
-        }
-
-        Expr::Block(block) => {
-            if let Stmt::Expr(expr) = &block.block.stmts[0] {
-                translate_expr(env, cur_kind, &expr)
-            } else {
-                unimplemented!("block")
-            }
-        }
-
-        Expr::Call(call) => {
-            let func_ident = if let Expr::Path(path) = &*call.func {
-                path.path.get_ident().unwrap()
-            } else {
-                unimplemented!("func ident")
-            };
-
-            let args = call
-                .args
-                .iter()
-                .map(|arg| translate_expr(env, cur_kind, arg))
-                .collect::<Vec<_>>();
-
-            FnTransOutput::merge(args, |mut env, args| {
-                let first_arg: Type = parse2(args[0].clone()).unwrap();
-                let bounds = env
-                    .bounds
-                    .entry(first_arg.clone())
-                    .or_insert_with(|| Vec::new());
-                let compute_ident =
-                    Ident::new(&format!("Compute{}", func_ident), Span::call_site());
-                let remaining_args = &args[1..];
-                bounds.push(parse2(quote! { #compute_ident<#(#remaining_args),*> }).unwrap());
-
-                let output_ty = quote! { #func_ident<#(#args),*> };
-                FnTransOutput { output_ty, env }
-            })
-        }
-
+        Expr::Match(match_) => translate_match_expr(env, cur_kind, match_),
+        Expr::Path(path) => translate_path_expr(env, cur_kind, path),
+        Expr::Tuple(tuple) => translate_tuple_expr(env, cur_kind, tuple),
+        Expr::Binary(binop) => translate_binary_expr(env, cur_kind, binop),
+        Expr::If(if_) => translate_if_expr(env, cur_kind, if_),
+        Expr::Block(block) => translate_block_expr(env, cur_kind, block),
+        Expr::Call(call) => translate_call_expr(env, cur_kind, call),
         Expr::Paren(paren) => translate_expr(env, cur_kind, &paren.expr),
-
         _ => unimplemented!("expr: {:?}", expr),
     }
 }
 
-// HACK: have to do this without HKT :(
-const BASE_KINDS: &[&str] = &["TNum", "TBool", "TList"];
+fn translate_match_expr(
+    env: &FnTransEnv,
+    cur_kind: &Ident,
+    match_: &ExprMatch,
+) -> Vec<FnTransOutput> {
+    let matched_ident = if let Expr::Path(path) = &*match_.expr {
+        path.path.get_ident().unwrap()
+    } else {
+        unimplemented!("match expr")
+    };
+
+    let match_ty = ident_to_type(matched_ident);
+    let arg_idx = env
+        .args
+        .iter()
+        .position(|arg| arg == &match_ty)
+        .expect(&format!("Invalid match on {}", matched_ident));
+
+    match_
+        .arms
+        .iter()
+        .map(|arm| {
+            let (variant, fields) = translate_pat(&arm.pat);
+
+            let mut env = env.clone();
+            let field_names = fields
+                .iter()
+                .map(|(ident, _)| ident)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            // if args = [X, Y] and expr is match Y { Q(Z) => ... }
+            // then update args to be [X, Q<Z>]
+            let new_type: Type = parse2(quote! {
+              #variant<#(#field_names),*>
+            })
+            .unwrap();
+            env.args[arg_idx] = new_type.clone();
+
+            // if quantifiers = [X, Y] then replace [Y] with [Z]
+            env.quantifiers = env
+                .quantifiers
+                .into_iter()
+                .filter(|ident| ident != matched_ident)
+                .collect::<Vec<_>>();
+            env.quantifiers.extend(field_names);
+
+            // if bounds = {Y: Foo<X>} then rename to {Q<Z>: Foo<X>}
+            let bounds = env.bounds.remove(&ident_to_type(&matched_ident)).unwrap();
+            env.bounds.insert(new_type.clone(), bounds);
+
+            // add field bounds
+            for (ident, kind) in fields.iter() {
+                if let Some(kind) = kind_to_type(kind) {
+                    env.bounds.insert(ident_to_type(ident), vec![kind]);
+                }
+            }
+
+            // add substitution for Y -> Q<Z>
+            env.substitutions.insert(matched_ident.clone(), new_type);
+
+            translate_expr(&env, cur_kind, &arm.body)
+        })
+        .flatten()
+        .collect::<Vec<_>>()
+}
+
+fn translate_path_expr(env: &FnTransEnv, _cur_kind: &Ident, path: &ExprPath) -> Vec<FnTransOutput> {
+    let ident = path.path.get_ident().unwrap();
+    let ty = env
+        .substitutions
+        .get(&ident)
+        .cloned()
+        .unwrap_or_else(|| ident_to_type(ident));
+    vec![FnTransOutput {
+        env: env.clone(),
+        output_ty: quote! { #ty },
+    }]
+}
+
+fn translate_tuple_expr(
+    env: &FnTransEnv,
+    _cur_kind: &Ident,
+    tuple: &ExprTuple,
+) -> Vec<FnTransOutput> {
+    if tuple.elems.len() == 0 {
+        vec![FnTransOutput {
+            env: env.clone(),
+            output_ty: quote! { () },
+        }]
+    } else {
+        unimplemented!("tuple")
+    }
+}
+
+fn translate_binary_expr(
+    env: &FnTransEnv,
+    cur_kind: &Ident,
+    binop: &ExprBinary,
+) -> Vec<FnTransOutput> {
+    let ExprBinary {
+        left, right, op, ..
+    } = binop;
+    let op = match op {
+        BinOp::Eq(_) => quote! { TypeEquals },
+        BinOp::And(_) => quote! { TAnd },
+        BinOp::Le(_) => quote! { TLessThanEqual },
+        BinOp::Add(_) => quote! { TAdd },
+        BinOp::Div(_) => quote! { TDivide },
+        BinOp::Sub(_) => quote! { TSub },
+        _ => unimplemented!("binop {:?}", binop.op),
+    };
+    let trans_expr: Expr = parse2(quote! { #op(#left, #right) }).unwrap();
+    translate_expr(env, cur_kind, &trans_expr)
+}
+
+fn translate_if_expr(env: &FnTransEnv, cur_kind: &Ident, if_: &ExprIf) -> Vec<FnTransOutput> {
+    let ExprIf {
+        cond,
+        then_branch,
+        else_branch,
+        ..
+    } = if_;
+    let (_else_token, else_) = else_branch
+        .as_ref()
+        .expect("If expression must have an 'else'");
+
+    let if_name = Ident::new(&format!("TIf{}", cur_kind), Span::call_site());
+    let trans_expr: Expr = parse2(quote! { #if_name(#cond, #then_branch, #else_) }).unwrap();
+    translate_expr(env, cur_kind, &trans_expr)
+}
+
+fn translate_block_expr(
+    env: &FnTransEnv,
+    cur_kind: &Ident,
+    block: &ExprBlock,
+) -> Vec<FnTransOutput> {
+    if let Stmt::Expr(expr) = &block.block.stmts[0] {
+        translate_expr(env, cur_kind, &expr)
+    } else {
+        unimplemented!("block")
+    }
+}
+
+fn translate_call_expr(env: &FnTransEnv, cur_kind: &Ident, call: &ExprCall) -> Vec<FnTransOutput> {
+    let ExprCall { func, args, .. } = call;
+
+    let func_ident = if let Expr::Path(path) = &**func {
+        path.path.get_ident().unwrap()
+    } else {
+        unimplemented!("func ident")
+    };
+
+    let args_vec: Vec<_> = args
+        .iter()
+        .map(|arg| translate_expr(env, cur_kind, arg))
+        .collect();
+
+    FnTransOutput::merge(args_vec, |mut env, args| {
+        let first_arg: Type = parse2(args[0].clone()).unwrap();
+        let bounds = env
+            .bounds
+            .entry(first_arg.clone())
+            .or_insert_with(|| Vec::new());
+        let compute_ident = Ident::new(&format!("Compute{}", func_ident), Span::call_site());
+        let remaining_args = &args[1..];
+        bounds.push(parse2(quote! { #compute_ident<#(#remaining_args),*> }).unwrap());
+
+        let output_ty = quote! { #func_ident<#(#args),*> };
+        FnTransOutput { output_ty, env }
+    })
+}
+
+fn translate_pat(pat: &Pat) -> (Ident, Vec<(Ident, Ident)>) {
+    match pat {
+        Pat::Ident(PatIdent { ident, .. }) => (ident.clone(), vec![]),
+        Pat::TupleStruct(tuple_struct) => {
+            let variant = tuple_struct.path.get_ident().unwrap().clone();
+            let fields = tuple_struct
+                .pat
+                .elems
+                .iter()
+                .map(|p| {
+                    if let Pat::Ident(PatIdent { ident, subpat, .. }) = &p {
+                        let kind = if let Some((_, p2)) = subpat {
+                            if let Pat::Ident(PatIdent { ident, .. }) = &**p2 {
+                                ident.clone()
+                            } else {
+                                panic!("RHS of @ must be an ident")
+                            }
+                        } else {
+                            panic!("Match tuple struct must have @ trait annotation")
+                        };
+
+                        (ident.clone(), kind)
+                    } else {
+                        unimplemented!("match pat ident")
+                    }
+                })
+                .collect::<Vec<_>>();
+            (variant, fields)
+        }
+        _ => unimplemented!("match pat"),
+    }
+}
 
 fn gen_impls(fn_: ItemFn) -> TokenStream {
     let fn_name = &fn_.sig.ident;
